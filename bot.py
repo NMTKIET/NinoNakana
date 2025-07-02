@@ -32,8 +32,8 @@ DATABASE_FILE = 'bot_data.db'
 # Specific channel ID for admin commands (still used for non-owners)
 ALLOWED_ADMIN_CHANNEL_ID = 1383013260902531074
 
-# Owner user ID (hardcoded as requested)
-OWNER_USER_ID = 1026107907646967838
+# Owner user IDs (hardcoded as requested)
+OWNER_IDS = [1026107907646967838, 882844895902040104]
 
 # Environment Variables
 DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
@@ -158,11 +158,12 @@ class MyBot(commands.Bot):
     async def on_ready(self):
         logger.info(f'Logged in as {self.user}!')
         logger.info(f'Bot ID: {self.user.id}')
-        try:
-            owner = await self.fetch_user(OWNER_USER_ID)
-            logger.info(f"Owner ID {OWNER_USER_ID} is valid (User: {owner.display_name}).")
-        except discord.NotFound:
-            logger.error(f"Owner ID {OWNER_USER_ID} is invalid or not found.")
+        for owner_id in OWNER_IDS:
+            try:
+                owner = await self.fetch_user(owner_id)
+                logger.info(f"Owner ID {owner_id} is valid (User: {owner.display_name}).")
+            except discord.NotFound:
+                logger.error(f"Owner ID {owner_id} is invalid or not found.")
         await self.loop.run_in_executor(None, init_db)
         logger.info("Database initialized or checked.")
 
@@ -175,7 +176,7 @@ class MyBot(commands.Bot):
                 await interaction.followup.send(f"Đã xảy ra lỗi khi thực thi lệnh: `{error.original}`. Vui lòng liên hệ quản trị viên.", ephemeral=True)
         elif isinstance(error, app_commands.CheckFailure):
             logger.warning(f"CheckFailure for command '{interaction.command.name}' by {interaction.user.display_name} (ID: {interaction.user.id}) in channel {interaction.channel} (ID: {interaction.channel_id}): {error}")
-            message = "Bạn không phải là chủ sở hữu bot!" if interaction.user.id != OWNER_USER_ID else f"Lệnh này chỉ có thể được sử dụng trong kênh quản trị viên: <#{ALLOWED_ADMIN_CHANNEL_ID}>."
+            message = "Bạn không phải là chủ sở hữu bot!" if interaction.user.id not in OWNER_IDS else f"Lệnh này chỉ có thể được sử dụng trong kênh quản trị viên: <#{ALLOWED_ADMIN_CHANNEL_ID}>."
             try:
                 await interaction.response.send_message(message, ephemeral=True)
             except discord.InteractionResponded:
@@ -189,16 +190,16 @@ class MyBot(commands.Bot):
 
 bot = MyBot()
 
-# Custom check for Owner user ID
+# Custom check for Owner user IDs
 def is_owner(interaction: discord.Interaction) -> bool:
-    is_owner = interaction.user.id == OWNER_USER_ID
+    is_owner = interaction.user.id in OWNER_IDS
     if not is_owner:
-        logger.warning(f"User {interaction.user.display_name} (ID: {interaction.user.id}) attempted to use an owner command but is not the owner.")
+        logger.warning(f"User {interaction.user.display_name} (ID: {interaction.user.id}) attempted to use an owner command but is not an owner.")
     return is_owner
 
-# Modified check for admin channel (Owner bypasses channel restriction)
+# Modified check for admin channel (Owners bypass channel restriction)
 def is_allowed_admin_channel(interaction: discord.Interaction) -> bool:
-    if interaction.user.id == OWNER_USER_ID:
+    if interaction.user.id in OWNER_IDS:
         return True
     if interaction.channel.id != ALLOWED_ADMIN_CHANNEL_ID:
         logger.warning(f"Command '{interaction.command.name}' attempted by {interaction.user.display_name} (ID: {interaction.user.id}) in unauthorized channel #{interaction.channel.name} (ID: {interaction.channel_id}).")
@@ -366,7 +367,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
             await interaction.followup.send(f"Đã xảy ra lỗi khi thực thi lệnh: `{error.original}`. Vui lòng liên hệ quản trị viên.", ephemeral=True)
     elif isinstance(error, app_commands.CheckFailure):
         logger.warning(f"CheckFailure for command '{interaction.command.name}' by {interaction.user.display_name} (ID: {interaction.user.id}) in channel {interaction.channel} (ID: {interaction.channel_id}): {error}")
-        message = "Bạn không phải là chủ sở hữu bot!" if interaction.user.id != OWNER_USER_ID else f"Lệnh này chỉ có thể được sử dụng trong kênh quản trị viên: <#{ALLOWED_ADMIN_CHANNEL_ID}>."
+        message = "Bạn không phải là chủ sở hữu bot!" if interaction.user.id not in OWNER_IDS else f"Lệnh này chỉ có thể được sử dụng trong kênh quản trị viên: <#{ALLOWED_ADMIN_CHANNEL_ID}>."
         try:
             await interaction.response.send_message(message, ephemeral=True)
         except discord.InteractionResponded:
@@ -797,7 +798,7 @@ async def quick_add_ug_command(interaction: discord.Interaction):
 async def get_ug_phone_command(interaction: discord.Interaction):
     user_id = interaction.user.id
     cost = 150
-    is_owner_user = user_id == OWNER_USER_ID
+    is_owner_user = user_id in OWNER_IDS
     if not is_owner_user:
         current_balance = await bot.loop.run_in_executor(None, get_user_hcoin, user_id)
         if current_balance < cost:
