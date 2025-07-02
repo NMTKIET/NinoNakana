@@ -9,9 +9,10 @@ import sqlite3
 import random
 import asyncio
 import string
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import logging
 from flask import Flask
+from threading import Thread
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s:%(levelname)s:%(name)s: %(message)s')
@@ -31,7 +32,7 @@ DATABASE_FILE = 'bot_data.db'
 # Specific channel ID for admin commands (still used for non-owners)
 ALLOWED_ADMIN_CHANNEL_ID = 1383013260902531074
 
-# Owner user ID
+# Owner user ID (hardcoded as requested)
 OWNER_USER_ID = 1026107907646967838
 
 # Environment Variables
@@ -39,9 +40,6 @@ DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 YEUMONEY_API_TOKEN = os.getenv('YEUMONEY_API_TOKEN')
 PASTEBIN_DEV_KEY = os.getenv('PASTEBIN_DEV_KEY')
 TEST_GUILD_ID = os.getenv('TEST_GUILD_ID')
-
-# Cooldown for /getcredit command (in seconds)
-GET_CREDIT_COOLDOWN_SECONDS = 5 * 60
 
 # Dictionary to store active multi-line input sessions for /quickaddug
 quick_add_ug_sessions = {}
@@ -84,12 +82,6 @@ def init_db():
             pastebin_url TEXT NOT NULL UNIQUE
         )
     ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS user_cooldowns (
-            user_id INTEGER PRIMARY KEY,
-            last_getcredit_time TEXT NOT NULL
-        )
-    ''')
     conn.commit()
     conn.close()
     initial_count, final_count = deduplicate_ug_phones_data()
@@ -114,25 +106,6 @@ def update_user_hcoin(user_id: int, amount: int):
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
     cursor.execute("INSERT OR REPLACE INTO user_balances (user_id, hcoin_balance) VALUES (?, COALESCE((SELECT hcoin_balance FROM user_balances WHERE user_id = ?), 0) + ?)", (user_id, user_id, amount))
-    conn.commit()
-    conn.close()
-
-# Function to get last getcredit time for a user
-def get_last_getcredit_time(user_id: int) -> datetime | None:
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT last_getcredit_time FROM user_cooldowns WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    conn.close()
-    if result:
-        return datetime.fromisoformat(result[0]).replace(tzinfo=timezone.utc)
-    return None
-
-# Function to set last getcredit time for a user
-def set_last_getcredit_time(user_id: int, timestamp: datetime):
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO user_cooldowns (user_id, last_getcredit_time) VALUES (?, ?)", (user_id, timestamp.isoformat()))
     conn.commit()
     conn.close()
 
@@ -185,6 +158,11 @@ class MyBot(commands.Bot):
     async def on_ready(self):
         logger.info(f'Logged in as {self.user}!')
         logger.info(f'Bot ID: {self.user.id}')
+        try:
+            owner = await self.fetch_user(OWNER_USER_ID)
+            logger.info(f"Owner ID {OWNER_USER_ID} is valid (User: {owner.display_name}).")
+        except discord.NotFound:
+            logger.error(f"Owner ID {OWNER_USER_ID} is invalid or not found.")
         await self.loop.run_in_executor(None, init_db)
         logger.info("Database initialized or checked.")
 
@@ -251,11 +229,15 @@ async def on_message(message: discord.Message):
                 error_count = 0
                 for data_item in collected_data:
                     try:
+                        json.loads(data_item)  # Validate JSON
                         cursor.execute("INSERT OR IGNORE INTO ug_phones (data_json) VALUES (?)", (data_item,))
                         if cursor.rowcount > 0:
                             added_count += 1
                         else:
                             skipped_count += 1
+                    except json.JSONDecodeError:
+                        error_count += 1
+                        logger.error(f"Invalid JSON in Local Storage data for user {user_id}: {data_item[:50]}...")
                     except sqlite3.Error as e:
                         error_count += 1
                         logger.error(f"SQLite Error adding Local Storage data for user {user_id}: {e}")
@@ -268,7 +250,7 @@ async def on_message(message: discord.Message):
                 if skipped_count > 0:
                     description += f"**{skipped_count}** Local Storage bị bỏ qua (đã tồn tại).\n"
                 if error_count > 0:
-                    description += f"**{error_count}** Local Storage gặp lỗi khi thêm. Vui lòng kiểm tra console bot."
+                    description += f"**{error_count}** Local Storage gặp lỗi khi thêm (dữ liệu không phải JSON hoặc lỗi khác). Vui lòng kiểm tra console bot."
                 embed = discord.Embed(
                     title="✅ Phiên Thêm Nhanh Local Storage Hoàn Tất!",
                     description=description,
@@ -287,12 +269,19 @@ async def on_message(message: discord.Message):
                 )
                 await message.channel.send(embed=embed)
         else:
-            bot.quick_add_ug_sessions[user_id].append(content)
-            logger.debug(f"User {message.author.display_name} (ID: {user_id}) added data to /quickaddug session: {content[:50]}...")
             try:
+                json.loads(content)  # Validate JSON
+                bot.quick_add_ug_sessions[user_id].append(content)
+                logger.debug(f"User {message.author.display_name} (ID: {user_id}) added valid JSON to /quickaddug session: {content[:50]}...")
                 await message.add_reaction("✅")
-            except discord.Forbidden:
-                pass
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid JSON from {message.author.display_name} (ID: {user_id}) in /quickaddug session.")
+                await message.add_reaction("❌")
+                await message.channel.send(embed=discord.Embed(
+                    title="❌ Dữ liệu không hợp lệ!",
+                    description="Vui lòng gửi dữ liệu Local Storage dạng JSON hợp lệ.",
+                    color=discord.Color.red()
+                ), ephemeral=True)
     await bot.process_commands(message)
 
 def create_pastebin_paste(text_content: str, title: str = "Bot Paste", paste_format: str = "text", expire_date: str = "10M"):
@@ -380,6 +369,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         try:
             await interaction.response.send_message(message, ephemeral=True)
         except discord.InteractionResponded:
+            await interaction.followup.sendgrok3-built-by-xai-2025-07-02-10-07-54.md
             await interaction.followup.send(message, ephemeral=True)
     else:
         logger.critical(f"Unknown AppCommand Error in command '{interaction.command.name}' by {interaction.user.display_name} (ID: {interaction.user.id}) in channel {interaction.channel} (ID: {interaction.channel_id}): {error}")
@@ -391,23 +381,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @bot.tree.command(name='getcredit', description='Get a new unique code by generating a Pastebin link.')
 async def get_credit(interaction: discord.Interaction):
     user_id = interaction.user.id
-    current_time = datetime.now(timezone.utc)
-    if user_id != OWNER_USER_ID:  # Skip cooldown for owner
-        last_time_used = await bot.loop.run_in_executor(None, get_last_getcredit_time, user_id)
-        if last_time_used:
-            time_elapsed = current_time - last_time_used
-            if time_elapsed.total_seconds() < GET_CREDIT_COOLDOWN_SECONDS:
-                remaining_time = timedelta(seconds=GET_CREDIT_COOLDOWN_SECONDS) - time_elapsed
-                minutes, seconds = divmod(remaining_time.total_seconds(), 60)
-                embed = discord.Embed(
-                    title="⏳ Đang trong thời gian hồi chiêu!",
-                    description=f"Bạn chỉ có thể sử dụng lệnh này mỗi {GET_CREDIT_COOLDOWN_SECONDS // 60} phút một lần.\n"
-                                f"Vui lòng đợi **{int(minutes)}p {int(seconds)}s** trước khi thử lại.",
-                    color=discord.Color.red()
-                )
-                await interaction.response.send_message(embed=embed, ephemeral=True)
-                return
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=True)
     generated_code = generate_random_code(20)
     logger.info(f"User {interaction.user.display_name} (ID: {user_id}) requested /getcredit. Generated code: {generated_code}")
     paste_title = f"Redeem Code for {interaction.user.name} - {generated_code}"
@@ -442,9 +416,7 @@ async def get_credit(interaction: discord.Interaction):
         conn.close()
     short_link = await bot.loop.run_in_executor(None, create_short_link, pastebin_url)
     if short_link:
-        if user_id != OWNER_USER_ID:  # Set cooldown for non-owners
-            await bot.loop.run_in_executor(None, set_last_getcredit_time, user_id, current_time)
-        logger.info(f"User {user_id} used /getcredit, cooldown set. Short link: {short_link}")
+        logger.info(f"User {user_id} used /getcredit. Short link: {short_link}")
         embed = discord.Embed(
             title="✨ Liên kết mã mới của bạn! ✨",
             description=f"Xin chào **{interaction.user.display_name}**! Đây là liên kết mã duy nhất mới của bạn. "
@@ -452,10 +424,9 @@ async def get_credit(interaction: discord.Interaction):
             color=discord.Color.green()
         )
         embed.add_field(name="🔗 Lấy mã của bạn tại đây:", value=f"**<{short_link}>**", inline=False)
-        embed.set_footer(text=f"Bạn có thể sử dụng /getcredit lại sau {GET_CREDIT_COOLDOWN_SECONDS // 60} phút.")
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         embed.timestamp = discord.utils.utcnow()
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(embed=embed, ephemeral=True)
     else:
         conn = sqlite3.connect(DATABASE_FILE)
         cursor = conn.cursor()
@@ -486,6 +457,7 @@ async def remove_code(interaction: discord.Interaction, code: str):
             color=discord.Color.green()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+        logger.infovà thông tin liên quan đến bot được cung cấp trong tài liệu này.
         logger.info(f"Code {code} removed by {interaction.user.display_name} (ID: {interaction.user.id}).")
     else:
         embed = discord.Embed(
@@ -745,6 +717,7 @@ class UGPhoneModal(ui.Modal, title='Nhập Local Storage'):
         conn = sqlite3.connect(DATABASE_FILE)
         cursor = conn.cursor()
         try:
+            json.loads(self.data_input.value)  # Validate JSON
             cursor.execute("INSERT OR IGNORE INTO ug_phones (data_json) VALUES (?)", (self.data_input.value,))
             if cursor.rowcount > 0:
                 embed = discord.Embed(
@@ -760,6 +733,14 @@ class UGPhoneModal(ui.Modal, title='Nhập Local Storage'):
                     color=discord.Color.blue()
                 )
                 logger.info(f"Duplicate Local Storage attempted via modal by {interaction.user.display_name} (ID: {interaction.user.id}).")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except json.JSONDecodeError:
+            logger.error(f"Invalid JSON in Local Storage data via modal by {interaction.user.display_name} (ID: {interaction.user.id}).")
+            embed = discord.Embed(
+                title="❌ Dữ liệu không hợp lệ!",
+                description="Vui lòng gửi dữ liệu Local Storage dạng JSON hợp lệ.",
+                color=discord.Color.red()
+            )
             await interaction.response.send_message(embed=embed, ephemeral=True)
         except sqlite3.Error as e:
             logger.error(f"SQLite Error when saving UG Phone data via modal for {interaction.user.display_name}: {e}")
@@ -910,6 +891,7 @@ async def delete_ug_data(interaction: discord.Interaction, data_to_delete: str):
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
     try:
+        json.loads(data_to_delete)  # Validate JSON
         cursor.execute("DELETE FROM ug_phones WHERE data_json = ?", (data_to_delete,))
         conn.commit()
         if cursor.rowcount > 0:
@@ -926,6 +908,14 @@ async def delete_ug_data(interaction: discord.Interaction, data_to_delete: str):
                 color=discord.Color.red()
             )
             logger.warning(f"Local Storage not found for deletion by {interaction.user.display_name} (ID: {interaction.user.id}).")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except json.JSONDecodeError:
+        logger.error(f"Invalid JSON in Local Storage data for deletion by {interaction.user.display_name} (ID: {interaction.user.id}).")
+        embed = discord.Embed(
+            title="❌ Dữ liệu không hợp lệ!",
+            description="Dữ liệu Local Storage phải là JSON hợp lệ.",
+            color=discord.Color.red()
+        )
         await interaction.followup.send(embed=embed, ephemeral=True)
     except sqlite3.Error as e:
         logger.error(f"SQLite Error deleting UG Phone data via /delete_ug_data for {interaction.user.display_name}: {e}")
