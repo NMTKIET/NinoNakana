@@ -1106,7 +1106,7 @@ async def info(interaction: discord.Interaction):
     - `/sync_commands`: Đồng bộ lệnh slash.
     - `/deduplicate_ugphone`: Chạy deduplication thủ công.
     """, inline=False)
-    embed.set_footer(text=f"Bot được tạo bởi [Tên hoặc Nhóm của bạn]")
+    embed.set_footer(text=f"Bot By SNIPA|Code By NMTKIET")
     embed.timestamp = discord.utils.utcnow()
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
