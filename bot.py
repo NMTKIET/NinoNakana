@@ -168,19 +168,20 @@ class MyBot(commands.Bot):
 
     async def on_tree_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.CommandInvokeError):
-            logger.error(f"CommandInvokeError in command '{interaction.command.name}' by {interaction.user} (ID: {interaction.user.id}) in channel {interaction.channel} (ID: {interaction.channel_id}): {error.original}")
+            logger.error(f"CommandInvokeError in command '{interaction.command.name}' by {interaction.user.display_name} (ID: {interaction.user.id}) in channel {interaction.channel} (ID: {interaction.channel_id}): {error.original}")
             try:
                 await interaction.response.send_message(f"Đã xảy ra lỗi khi thực thi lệnh: `{error.original}`. Vui lòng liên hệ quản trị viên.", ephemeral=True)
             except discord.InteractionResponded:
                 await interaction.followup.send(f"Đã xảy ra lỗi khi thực thi lệnh: `{error.original}`. Vui lòng liên hệ quản trị viên.", ephemeral=True)
         elif isinstance(error, app_commands.CheckFailure):
-            logger.warning(f"CheckFailure for command '{interaction.command.name}' by {interaction.user} (ID: {interaction.user.id}) in channel {interaction.channel} (ID: {interaction.channel_id}): {error}")
+            logger.warning(f"CheckFailure for command '{interaction.command.name}' by {interaction.user.display_name} (ID: {interaction.user.id}) in channel {interaction.channel} (ID: {interaction.channel_id}): {error}")
+            message = "Bạn không phải là chủ sở hữu bot!" if interaction.user.id != OWNER_USER_ID else f"Lệnh này chỉ có thể được sử dụng trong kênh quản trị viên: <#{ALLOWED_ADMIN_CHANNEL_ID}>."
             try:
-                await interaction.response.send_message(f"Bạn không có quyền sử dụng lệnh này.", ephemeral=True)
+                await interaction.response.send_message(message, ephemeral=True)
             except discord.InteractionResponded:
-                await interaction.followup.send(f"Bạn không có quyền sử dụng lệnh này.", ephemeral=True)
+                await interaction.followup.send(message, ephemeral=True)
         else:
-            logger.error(f"Unhandled app command error in command '{interaction.command.name}' by {interaction.user} (ID: {interaction.user.id}) in channel {interaction.channel} (ID: {interaction.channel_id}): {error}")
+            logger.critical(f"Unknown AppCommand Error in command '{interaction.command.name}' by {interaction.user.display_name} (ID: {interaction.user.id}) in channel {interaction.channel} (ID: {interaction.channel_id}): {error}")
             try:
                 await interaction.response.send_message(f"Đã xảy ra lỗi không mong muốn: `{error}`. Vui lòng liên hệ quản trị viên.", ephemeral=True)
             except discord.InteractionResponded:
@@ -369,7 +370,6 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         try:
             await interaction.response.send_message(message, ephemeral=True)
         except discord.InteractionResponded:
-            await interaction.followup.sendgrok3-built-by-xai-2025-07-02-10-07-54.md
             await interaction.followup.send(message, ephemeral=True)
     else:
         logger.critical(f"Unknown AppCommand Error in command '{interaction.command.name}' by {interaction.user.display_name} (ID: {interaction.user.id}) in channel {interaction.channel} (ID: {interaction.channel_id}): {error}")
@@ -457,7 +457,6 @@ async def remove_code(interaction: discord.Interaction, code: str):
             color=discord.Color.green()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
-        logger.infovà thông tin liên quan đến bot được cung cấp trong tài liệu này.
         logger.info(f"Code {code} removed by {interaction.user.display_name} (ID: {interaction.user.id}).")
     else:
         embed = discord.Embed(
@@ -1084,7 +1083,7 @@ async def hcoin_top(interaction: discord.Interaction):
 async def info(interaction: discord.Interaction):
     embed = discord.Embed(
         title="ℹ️ Thông tin Bot",
-        description="Chào mừng bạn đến với bot của chúng tôi!",
+        description="Chào mừng bạn đến với bot của NMTKIET!",
         color=discord.Color.purple()
     )
     embed.add_field(name="Chức năng chính", value="""
@@ -1106,7 +1105,7 @@ async def info(interaction: discord.Interaction):
     - `/sync_commands`: Đồng bộ lệnh slash.
     - `/deduplicate_ugphone`: Chạy deduplication thủ công.
     """, inline=False)
-    embed.set_footer(text=f"Bot By SNIPA|Code By NMTKIET")
+    embed.set_footer(text="Bot được tạo bởi NMTKIET")
     embed.timestamp = discord.utils.utcnow()
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
