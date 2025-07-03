@@ -11,8 +11,7 @@ import asyncio
 import string
 from datetime import datetime, timezone
 import logging
-from flask import Flask
-from threading import Thread
+from tenacity import retry, stop_after_attempt, wait_fixed
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s:%(levelname)s:%(name)s: %(message)s')
@@ -29,30 +28,48 @@ intents.members = True
 # Database file name
 DATABASE_FILE = 'bot_data.db'
 
-# Specific channel ID for admin commands (still used for non-owners)
+# Specific channel ID for admin commands
 ALLOWED_ADMIN_CHANNEL_ID = 1383013260902531074
 
-# Owner user IDs (hardcoded as requested)
+# Owner user IDs
 OWNER_IDS = [1026107907646967838, 882844895902040104]
 
 # Environment Variables
 DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 YEUMONEY_API_TOKEN = os.getenv('YEUMONEY_API_TOKEN')
-PASTEBIN_DEV_KEY = os.getenv('PASTEBIN_DEV_KEY')
 TEST_GUILD_ID = os.getenv('TEST_GUILD_ID')
+
+# Placeholder for web generator URL (replace with your actual URL)
+WEB_GENERATOR_BASE_URL = 'https://example.com/?key='
 
 # Dictionary to store active multi-line input sessions for /quickaddug
 quick_add_ug_sessions = {}
 
+# Database connection pool
+class Database:
+    def __init__(self, db_file):
+        self.conn = sqlite3.connect(db_file, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+
+    def get_cursor(self):
+        return self.conn.cursor()
+
+    def commit(self):
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
+db = Database(DATABASE_FILE)
+
 # Function to generate a random alphanumeric code
 def generate_random_code(length=20):
     characters = string.ascii_uppercase + string.digits
-    return ''.join(random.choice(characters) for i in range(length))
+    return ''.join(random.choice(characters) for _ in range(length))
 
 # Function to initialize the database and tables
 def init_db():
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
+    cursor = db.get_cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS main_link (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,8 +99,7 @@ def init_db():
             pastebin_url TEXT NOT NULL UNIQUE
         )
     ''')
-    conn.commit()
-    conn.close()
+    db.commit()
     initial_count, final_count = deduplicate_ug_phones_data()
     if initial_count != final_count:
         logger.info(f"Deduplication completed for ug_phones. Initial: {initial_count}, Final: {final_count}. Removed {initial_count - final_count} duplicates.")
@@ -92,27 +108,20 @@ def init_db():
 
 # Function to get user hcoin balance
 def get_user_hcoin(user_id: int) -> int:
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
+    cursor = db.get_cursor()
     cursor.execute("SELECT hcoin_balance FROM user_balances WHERE user_id = ?", (user_id,))
     result = cursor.fetchone()
-    conn.close()
-    if result:
-        return result[0]
-    return 0
+    return result[0] if result else 0
 
 # Function to update user hcoin balance
 def update_user_hcoin(user_id: int, amount: int):
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
+    cursor = db.get_cursor()
     cursor.execute("INSERT OR REPLACE INTO user_balances (user_id, hcoin_balance) VALUES (?, COALESCE((SELECT hcoin_balance FROM user_balances WHERE user_id = ?), 0) + ?)", (user_id, user_id, amount))
-    conn.commit()
-    conn.close()
+    db.commit()
 
 # Function to deduplicate ug_phones data
 def deduplicate_ug_phones_data():
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
+    cursor = db.get_cursor()
     cursor.execute("SELECT COUNT(*) FROM ug_phones")
     initial_count = cursor.fetchone()[0]
     cursor.execute('''
@@ -126,9 +135,43 @@ def deduplicate_ug_phones_data():
     cursor.execute('DROP TABLE IF EXISTS ug_phones_temp;')
     cursor.execute("SELECT COUNT(*) FROM ug_phones")
     final_count = cursor.fetchone()[0]
-    conn.commit()
-    conn.close()
+    db.commit()
     return initial_count, final_count
+
+# Function to generate web link with random code
+def create_web_generator_link(code: str):
+    web_link = f"{WEB_GENERATOR_BASE_URL}{code}"
+    logger.info(f"Generated web link for code {code}: {web_link}")
+    return web_link
+
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+def create_short_link(long_url: str):
+    if not YEUMONEY_API_TOKEN:
+        logger.error("Error: YEUMONEY_API_TOKEN is not set in environment variables.")
+        return None
+    api_url = "https://yeumoney.com/QL_api.php"
+    params = {
+        "token": YEUMONEY_API_TOKEN,
+        "url": long_url,
+        "format": "json"
+    }
+    try:
+        response = requests.get(api_url, params=params)
+        response.raise_for_status()
+        result = response.json()
+        if result.get("status") == "success" and "shortenedUrl" in result:
+            logger.info(f"Successfully created short link: {result['shortenedUrl']}")
+            return result["shortenedUrl"]
+        else:
+            error_message = result.get("message", "Unknown API error.")
+            logger.error(f"Error creating short link on Yeumoney.com. API response: {result}. Error: {error_message}")
+            return None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error connecting to Yeumoney.com API: {e}")
+        return None
+    except json.JSONDecodeError:
+        logger.error(f"Error decoding JSON from Yeumoney.com API response: {response.text}")
+        return None
 
 class MyBot(commands.Bot):
     def __init__(self):
@@ -224,14 +267,13 @@ async def on_message(message: discord.Message):
                 )
                 await message.channel.send(embed=embed)
             else:
-                conn = sqlite3.connect(DATABASE_FILE)
-                cursor = conn.cursor()
+                cursor = db.get_cursor()
                 added_count = 0
                 skipped_count = 0
                 error_count = 0
                 for data_item in collected_data:
                     try:
-                        json.loads(data_item)  # Validate JSON
+                        json.loads(data_item)
                         cursor.execute("INSERT OR IGNORE INTO ug_phones (data_json) VALUES (?)", (data_item,))
                         if cursor.rowcount > 0:
                             added_count += 1
@@ -246,8 +288,7 @@ async def on_message(message: discord.Message):
                     except Exception as e:
                         error_count += 1
                         logger.error(f"Unexpected error adding Local Storage data for user {user_id}: {e}")
-                conn.commit()
-                conn.close()
+                db.commit()
                 description = f"**{added_count}** Local Storage đã được thêm thành công vào kho.\n"
                 if skipped_count > 0:
                     description += f"**{skipped_count}** Local Storage bị bỏ qua (đã tồn tại).\n"
@@ -272,7 +313,7 @@ async def on_message(message: discord.Message):
                 await message.channel.send(embed=embed)
         else:
             try:
-                json.loads(content)  # Validate JSON
+                json.loads(content)
                 bot.quick_add_ug_sessions[user_id].append(content)
                 logger.debug(f"User {message.author.display_name} (ID: {user_id}) added valid JSON to /quickaddug session: {content[:50]}...")
                 await message.add_reaction("✅")
@@ -285,77 +326,6 @@ async def on_message(message: discord.Message):
                     color=discord.Color.red()
                 ), ephemeral=True)
     await bot.process_commands(message)
-
-def create_pastebin_paste(text_content: str, title: str = "Bot Paste", paste_format: str = "text", expire_date: str = "10M"):
-    if not PASTEBIN_DEV_KEY:
-        logger.error("Error: PASTEBIN_DEV_KEY is not set in environment variables.")
-        return None
-    api_url = "https://pastebin.com/api/api_post.php"
-    payload = {
-        'api_dev_key': PASTEBIN_DEV_KEY,
-        'api_option': 'paste',
-        'api_paste_code': text_content,
-        'api_paste_name': title,
-        'api_paste_format': paste_format,
-        'api_paste_private': '1',
-        'api_paste_expire_date': expire_date,
-    }
-    try:
-        response = requests.post(api_url, data=payload)
-        response.raise_for_status()
-        if response.status_code == 200 and response.text.startswith("https://pastebin.com/"):
-            logger.info(f"Successfully created Pastebin: {response.text}")
-            return response.text
-        else:
-            logger.error(f"Error creating paste on Pastebin.com. API response: {response.text}")
-            return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error connecting to Pastebin.com API: {e}")
-        return None
-
-def fetch_pastebin_content(pastebin_url: str):
-    if "pastebin.com/" in pastebin_url:
-        paste_id = pastebin_url.split('/')[-1]
-        raw_url = f"https://pastebin.com/raw/{paste_id}"
-    else:
-        logger.warning(f"Invalid Pastebin URL format: {pastebin_url}")
-        return None
-    try:
-        response = requests.get(raw_url)
-        response.raise_for_status()
-        logger.info(f"Successfully fetched content from raw Pastebin URL: {raw_url}")
-        return response.text.strip()
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching content from raw Pastebin URL '{raw_url}': {e}")
-        return None
-
-def create_short_link(long_url: str):
-    if not YEUMONEY_API_TOKEN:
-        logger.error("Error: YEUMONEY_API_TOKEN is not set in environment variables.")
-        return None
-    api_url = "https://yeumoney.com/QL_api.php"
-    params = {
-        "token": YEUMONEY_API_TOKEN,
-        "url": long_url,
-        "format": "json"
-    }
-    try:
-        response = requests.get(api_url, params=params)
-        response.raise_for_status()
-        result = response.json()
-        if result.get("status") == "success" and "shortenedUrl" in result:
-            logger.info(f"Successfully created short link: {result['shortenedUrl']}")
-            return result["shortenedUrl"]
-        else:
-            error_message = result.get("message", "Unknown API error.")
-            logger.error(f"Error creating short link on Yeumoney.com. API response: {result}. Error: {error_message}")
-            return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error connecting to Yeumoney.com API: {e}")
-        return None
-    except json.JSONDecodeError:
-        logger.error(f"Error decoding JSON from Yeumoney.com API response: {response.text}")
-        return None
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -379,32 +349,30 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         except discord.InteractionResponded:
             await interaction.followup.send(f"Đã xảy ra lỗi không mong muốn: `{error}`. Vui lòng liên hệ quản trị viên.", ephemeral=True)
 
-@bot.tree.command(name='getcredit', description='Get a new unique code by generating a Pastebin link.')
+@bot.tree.command(name='getcredit', description='Get a new unique code via a web generator link.')
+@app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
 async def get_credit(interaction: discord.Interaction):
     user_id = interaction.user.id
     await interaction.response.defer(ephemeral=True)
     generated_code = generate_random_code(20)
     logger.info(f"User {interaction.user.display_name} (ID: {user_id}) requested /getcredit. Generated code: {generated_code}")
-    paste_title = f"Redeem Code for {interaction.user.name} - {generated_code}"
-    expire_date = "10M"
-    pastebin_url = await bot.loop.run_in_executor(None, create_pastebin_paste, generated_code, paste_title, "text", expire_date)
-    if not pastebin_url:
+    web_link = await bot.loop.run_in_executor(None, create_web_generator_link, generated_code)
+    if not web_link:
         embed = discord.Embed(
-            title="❌ Không thể tạo mã!",
-            description='Không thể tạo Pastebin cho mã của bạn. Vui lòng thử lại sau hoặc liên hệ quản trị viên.',
+            title="❌ Không thể tạo liên kết!",
+            description='Không thể tạo liên kết web cho mã của bạn. Vui lòng thử lại sau hoặc liên hệ quản trị viên.',
             color=discord.Color.red()
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
-        logger.error(f"Failed to create Pastebin for user {user_id}'s /getcredit request.")
+        logger.error(f"Failed to create web link for user {user_id}'s /getcredit request.")
         return
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
+    cursor = db.get_cursor()
     try:
         cursor.execute("INSERT INTO redemption_codes (code) VALUES (?)", (generated_code,))
-        conn.commit()
+        db.commit()
         logger.info(f"Code {generated_code} saved to DB for user {user_id}.")
     except sqlite3.IntegrityError:
-        conn.close()
+        db.commit()
         embed = discord.Embed(
             title="❌ Lỗi tạo mã!",
             description='Không thể tạo mã duy nhất. Vui lòng thử lại.',
@@ -413,9 +381,7 @@ async def get_credit(interaction: discord.Interaction):
         await interaction.followup.send(embed=embed, ephemeral=True)
         logger.error(f"IntegrityError: Generated code {generated_code} already exists in DB for user {user_id}.")
         return
-    finally:
-        conn.close()
-    short_link = await bot.loop.run_in_executor(None, create_short_link, pastebin_url)
+    short_link = await bot.loop.run_in_executor(None, create_short_link, web_link)
     if short_link:
         logger.info(f"User {user_id} used /getcredit. Short link: {short_link}")
         embed = discord.Embed(
@@ -429,12 +395,9 @@ async def get_credit(interaction: discord.Interaction):
         embed.timestamp = discord.utils.utcnow()
         await interaction.followup.send(embed=embed, ephemeral=True)
     else:
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
         cursor.execute("DELETE FROM redemption_codes WHERE code = ?", (generated_code,))
-        conn.commit()
-        conn.close()
-        logger.error(f"Failed to create short link for Pastebin {pastebin_url}. Deleted code {generated_code} from DB.")
+        db.commit()
+        logger.error(f"Failed to create short link for web link {web_link}. Deleted code {generated_code} from DB.")
         embed = discord.Embed(
             title="❌ Không thể tạo liên kết!",
             description='Không thể tạo liên kết rút gọn vào lúc này. Mã đã tạo đã bị xóa. Vui lòng thử lại sau.',
@@ -447,10 +410,9 @@ async def get_credit(interaction: discord.Interaction):
 @app_commands.check(is_allowed_admin_channel)
 @app_commands.describe(code='The code you want to remove (e.g., ABCDE12345)')
 async def remove_code(interaction: discord.Interaction, code: str):
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
+    cursor = db.get_cursor()
     cursor.execute("DELETE FROM redemption_codes WHERE code = ?", (code,))
-    conn.commit()
+    db.commit()
     if cursor.rowcount > 0:
         embed = discord.Embed(
             title="✅ Mã đã xóa thành công!",
@@ -467,7 +429,6 @@ async def remove_code(interaction: discord.Interaction, code: str):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
         logger.warning(f"Attempt to remove non-existent code {code} by {interaction.user.display_name} (ID: {interaction.user.id}).")
-    conn.close()
 
 class RedeemMultipleCodesModal(ui.Modal, title='Đổi Nhiều Mã'):
     codes_input = ui.TextInput(
@@ -476,6 +437,7 @@ class RedeemMultipleCodesModal(ui.Modal, title='Đổi Nhiều Mã'):
         style=discord.TextStyle.paragraph,
         max_length=4000
     )
+
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         user_id = interaction.user.id
@@ -491,8 +453,7 @@ class RedeemMultipleCodesModal(ui.Modal, title='Đổi Nhiều Mã'):
             )
             await interaction.followup.send(embed=embed, ephemeral=True)
             return
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
+        cursor = db.get_cursor()
         redeemed_count = 0
         invalid_count = 0
         total_hcoin_earned = 0
@@ -516,11 +477,10 @@ class RedeemMultipleCodesModal(ui.Modal, title='Đổi Nhiều Mã'):
                 logger.error(f"Unexpected error processing code '{code}' for redemption by {user_id}: {e}")
                 invalid_count += 1
                 failed_codes.append(code)
-        conn.commit()
+        db.commit()
         if total_hcoin_earned > 0:
             await bot.loop.run_in_executor(None, update_user_hcoin, user_id, total_hcoin_earned)
         current_balance = await bot.loop.run_in_executor(None, get_user_hcoin, user_id)
-        conn.close()
         title = "✨ Kết Quả Đổi Mã ✨"
         color = discord.Color.green() if redeemed_count > 0 else discord.Color.orange()
         description_parts = []
@@ -553,14 +513,13 @@ async def redeem_code(interaction: discord.Interaction, code: str = None):
         await interaction.response.defer(ephemeral=True)
         user_id = interaction.user.id
         hcoin_reward = 150
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
+        cursor = db.get_cursor()
         try:
             cursor.execute("SELECT code FROM redemption_codes WHERE code = ?", (code,))
             existing_code = cursor.fetchone()
             if existing_code:
                 cursor.execute("DELETE FROM redemption_codes WHERE code = ?", (code,))
-                conn.commit()
+                db.commit()
                 await bot.loop.run_in_executor(None, update_user_hcoin, user_id, hcoin_reward)
                 current_balance = await bot.loop.run_in_executor(None, get_user_hcoin, user_id)
                 embed = discord.Embed(
@@ -588,7 +547,7 @@ async def redeem_code(interaction: discord.Interaction, code: str = None):
             )
             await interaction.followup.send(embed=embed, ephemeral=True)
         finally:
-            conn.close()
+            db.commit()
     else:
         logger.info(f"User {interaction.user.display_name} (ID: {interaction.user.id}) used /redeem without a code, showing modal.")
         await interaction.response.send_modal(RedeemMultipleCodesModal())
@@ -604,14 +563,13 @@ async def quick_redeem_code_command_modal(interaction: discord.Interaction):
 @app_commands.describe(type_to_list='Choose what to list: "code", "link", or "localstorage".')
 @app_commands.choices(type_to_list=[
     app_commands.Choice(name="Codes", value="code"),
-    app_commands.Choice(name=" Pastebin Links", value="link"),
+    app_commands.Choice(name="Pastebin Links", value="link"),
     app_commands.Choice(name="Local Storage", value="localstorage")
 ])
 async def list_items(interaction: discord.Interaction, type_to_list: app_commands.Choice[str]):
     await interaction.response.defer(ephemeral=True)
     logger.info(f"User {interaction.user.display_name} (ID: {interaction.user.id}) used /list {type_to_list.value}.")
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
+    cursor = db.get_cursor()
     title = ""
     color = discord.Color.blue()
     items = []
@@ -649,7 +607,6 @@ async def list_items(interaction: discord.Interaction, type_to_list: app_command
                 color=color
             )
             await interaction.followup.send(embed=embed, ephemeral=True)
-            conn.close()
             return
         formatted_items_lines = []
         for item_id, item_content in items:
@@ -685,7 +642,6 @@ async def list_items(interaction: discord.Interaction, type_to_list: app_command
             )
             embed_to_send.set_footer(text=f"Tổng số {type_to_list.name.lower()}: {len(items)}")
             await interaction.followup.send(embed=embed_to_send, ephemeral=True)
-        conn.close()
         return
     if len(description) > 4000:
         embed = discord.Embed(
@@ -704,7 +660,6 @@ async def list_items(interaction: discord.Interaction, type_to_list: app_command
         )
         embed.set_footer(text=f"Tổng số {type_to_list.name.lower()}: {len(items)}")
         await interaction.followup.send(embed=embed, ephemeral=True)
-    conn.close()
 
 class UGPhoneModal(ui.Modal, title='Nhập Local Storage'):
     data_input = ui.TextInput(
@@ -713,11 +668,11 @@ class UGPhoneModal(ui.Modal, title='Nhập Local Storage'):
         style=discord.TextStyle.paragraph,
         max_length=4000
     )
+
     async def on_submit(self, interaction: discord.Interaction):
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
+        cursor = db.get_cursor()
         try:
-            json.loads(self.data_input.value)  # Validate JSON
+            json.loads(self.data_input.value)
             cursor.execute("INSERT OR IGNORE INTO ug_phones (data_json) VALUES (?)", (self.data_input.value,))
             if cursor.rowcount > 0:
                 embed = discord.Embed(
@@ -760,7 +715,7 @@ class UGPhoneModal(ui.Modal, title='Nhập Local Storage'):
             )
             await interaction.response.send_message(embed=embed, ephemeral=True)
         finally:
-            conn.close()
+            db.commit()
 
 @bot.tree.command(name='addugphone', description='Add Local Storage info for users to receive.')
 @app_commands.check(is_owner)
@@ -811,8 +766,7 @@ async def get_ug_phone_command(interaction: discord.Interaction):
             logger.warning(f"User {interaction.user.display_name} (ID: {user_id}) tried to /getugphone but had insufficient balance ({current_balance} < {cost}).")
             return
     await interaction.response.defer(ephemeral=True)
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
+    cursor = db.get_cursor()
     cursor.execute("SELECT id, data_json FROM ug_phones ORDER BY RANDOM() LIMIT 1")
     result = cursor.fetchone()
     if not result:
@@ -822,7 +776,6 @@ async def get_ug_phone_command(interaction: discord.Interaction):
             color=discord.Color.orange()
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
-        conn.close()
         logger.warning(f"User {interaction.user.display_name} (ID: {user_id}) tried to /getugphone, but ug_phones table is empty.")
         return
     item_id, local_storage_data = result
@@ -854,12 +807,12 @@ async def get_ug_phone_command(interaction: discord.Interaction):
             await interaction.followup.send(embed=embed, ephemeral=True)
             logger.info(f"Sent Local Storage to DM of {user_id}.")
         cursor.execute("DELETE FROM ug_phones WHERE id = ?", (item_id,))
-        conn.commit()
+        db.commit()
         logger.info(f"Local Storage item with ID {item_id} successfully deleted from DB after being sent to user {user_id}.")
     except discord.Forbidden:
         embed = discord.Embed(
             title="🚫 Không thể gửi DM!",
-            description='Tôi không thể gửi tin nhắn trực tiếp cho bạn. Vui lòng kiểm tra cài đặt quyền riêng tư của bạn (cho phép tin nhắn trực tiếp từ thành viên máy chủ). Local Storage không bị trừ và vẫn còn trong kho.',
+            description='Tôi không thể gửi tin nhắn trực tiếp cho bạn. Vui lòng bật **Cho phép tin nhắn trực tiếp từ thành viên máy chủ** trong cài đặt quyền riêng tư. Coin đã được hoàn lại.',
             color=discord.Color.red()
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
@@ -879,7 +832,7 @@ async def get_ug_phone_command(interaction: discord.Interaction):
             await bot.loop.run_in_executor(None, update_user_hcoin, user_id, cost)
             logger.info(f"Refunded {cost} coins to user {user_id} due to DM failure for Local Storage ID {item_id}.")
     finally:
-        conn.close()
+        db.commit()
 
 @bot.tree.command(name='delete_ug_data', description='Delete a Local Storage entry by its full content.')
 @app_commands.check(is_owner)
@@ -888,12 +841,11 @@ async def get_ug_phone_command(interaction: discord.Interaction):
 async def delete_ug_data(interaction: discord.Interaction, data_to_delete: str):
     await interaction.response.defer(ephemeral=True)
     logger.info(f"User {interaction.user.display_name} (ID: {interaction.user.id}) used /delete_ug_data.")
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
+    cursor = db.get_cursor()
     try:
-        json.loads(data_to_delete)  # Validate JSON
+        json.loads(data_to_delete)
         cursor.execute("DELETE FROM ug_phones WHERE data_json = ?", (data_to_delete,))
-        conn.commit()
+        db.commit()
         if cursor.rowcount > 0:
             embed = discord.Embed(
                 title="✅ Xóa Local Storage Thành Công!",
@@ -934,8 +886,6 @@ async def delete_ug_data(interaction: discord.Interaction, data_to_delete: str):
             color=discord.Color.red()
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
-    finally:
-        conn.close()
 
 @bot.tree.command(name='delete_ug_by_id', description='Delete a Local Storage entry by its unique ID.')
 @app_commands.check(is_owner)
@@ -943,12 +893,11 @@ async def delete_ug_data(interaction: discord.Interaction, data_to_delete: str):
 @app_commands.describe(item_id='The unique ID of the Local Storage entry to delete.')
 async def delete_ug_by_id(interaction: discord.Interaction, item_id: int):
     await interaction.response.defer(ephemeral=True)
-    logger.info(f"User {interaction.user.display_name} (ID: {interaction.user.id}) used /delete_ug_by_id with ID: {item_id}.")
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
+    logger.info(f"User {interaction.user.display_name} (ID: {interaction.user.id}) used /delete_ug_by_id with ID: {item_id}")
+    cursor = db.get_cursor()
     try:
         cursor.execute("DELETE FROM ug_phones WHERE id = ?", (item_id,))
-        conn.commit()
+        db.commit()
         if cursor.rowcount > 0:
             embed = discord.Embed(
                 title="✅ Xóa Local Storage Thành Công!",
@@ -981,8 +930,6 @@ async def delete_ug_by_id(interaction: discord.Interaction, item_id: int):
             color=discord.Color.red()
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
-    finally:
-        conn.close()
 
 @bot.tree.command(name='balance', description='Check your Hcoin balance.')
 async def balance(interaction: discord.Interaction):
@@ -1048,11 +995,9 @@ async def remove_hcoin(interaction: discord.Interaction, user: discord.Member, a
 @bot.tree.command(name='hcoin_top', description='Show top Hcoin balances.')
 async def hcoin_top(interaction: discord.Interaction):
     await interaction.response.defer()
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
+    cursor = db.get_cursor()
     cursor.execute("SELECT user_id, hcoin_balance FROM user_balances ORDER BY hcoin_balance DESC LIMIT 10")
     top_users = cursor.fetchall()
-    conn.close()
     if not top_users:
         embed = discord.Embed(
             title="🏆 Bảng xếp hạng Hcoin",
@@ -1106,7 +1051,7 @@ async def info(interaction: discord.Interaction):
     - `/sync_commands`: Đồng bộ lệnh slash.
     - `/deduplicate_ugphone`: Chạy deduplication thủ công.
     """, inline=False)
-    embed.set_footer(text="Bot được tạo bởi NMTKIET")
+    embed.set_footer(text="Bot By SNIPAVN|Code Bot By NMTKIET")
     embed.timestamp = discord.utils.utcnow()
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
@@ -1180,12 +1125,6 @@ async def sync_commands(interaction: discord.Interaction):
             color=discord.Color.red()
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
-
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Bot is running!"
 
 if __name__ == "__main__":
     if DISCORD_BOT_TOKEN:
