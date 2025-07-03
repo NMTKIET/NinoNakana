@@ -40,7 +40,7 @@ YEUMONEY_API_TOKEN = os.getenv('YEUMONEY_API_TOKEN')
 TEST_GUILD_ID = os.getenv('TEST_GUILD_ID')
 
 # Placeholder for web generator URL (replace with your actual URL)
-WEB_GENERATOR_BASE_URL = 'https://example.com/?key='
+WEB_GENERATOR_BASE_URL = 'https://itsukinguyen.github.io/Website/?key='
 
 # Dictionary to store active multi-line input sessions for /quickaddug
 quick_add_ug_sessions = {}
